@@ -65,6 +65,30 @@ SIGMA_ALIASES = [
     "c sigma pct",
 ]
 ID_ALIASES = ["id", "sample", "sample_id", "образец", "точка"]
+ASSUMED_TEMP_ALIASES = [
+    "предполагаемая температура",
+    "предполагаемая_t",
+    "предполагаемая t",
+    "расчетная температура",
+    "ожидаемая температура",
+    "target temperature",
+    "target_temperature",
+    "assumed temperature",
+    "assumed_temperature",
+    "expected temperature",
+    "expected_temperature",
+]
+
+GRAIN_SIZE_MM = {
+    3.0: 0.125,
+    4.0: 0.088,
+    5.0: 0.062,
+    6.0: 0.044,
+    7.0: 0.031,
+    8.0: 0.022,
+    9.0: 0.015,
+    10.0: 0.011,
+}
 
 
 @dataclass
@@ -131,6 +155,8 @@ def prepare_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = raw_df.copy()
     df.columns = [str(col).strip() for col in df.columns]
 
+    assumed_temp_col = find_column(df.columns, ASSUMED_TEMP_ALIASES)
+
     mapping = {
         "T": find_column(df.columns, TARGET_ALIASES),
         "D": find_column(df.columns, D_ALIASES),
@@ -171,6 +197,9 @@ def prepare_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     prepared = prepared[(prepared["D"] > 0) & (prepared["tau"] > 0) & (prepared["c_sigma"] > 0)].copy()
     prepared = prepared[prepared["T"] > -273.15].copy()
 
+    prepared["grain_size_mm"] = prepared["G"].map(GRAIN_SIZE_MM)
+    prepared = prepared.dropna(subset=["grain_size_mm"]).copy()
+
     if prepared.empty:
         raise ValueError("После очистки не осталось корректных строк. Проверьте данные и единицы измерения.")
 
@@ -179,7 +208,61 @@ def prepare_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     prepared["ln_D"] = np.log(prepared["D"])
     prepared["ln_tau"] = np.log(prepared["tau"])
     prepared["ln_c_sigma"] = np.log(prepared["c_sigma"])
+    prepared["ln_grain_size"] = np.log(prepared["grain_size_mm"])
 
+    if assumed_temp_col is not None:
+        prepared["T_assumed"] = pd.to_numeric(df.loc[prepared.index, assumed_temp_col], errors="coerce")
+
+    return prepared.reset_index(drop=True)
+
+
+def prepare_calculation_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
+    df = raw_df.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+
+    mapping = {
+        "D": find_column(df.columns, D_ALIASES),
+        "tau": find_column(df.columns, TAU_ALIASES),
+        "G": find_column(df.columns, GRAIN_ALIASES),
+        "c_sigma": find_column(df.columns, SIGMA_ALIASES),
+        "point_id": find_column(df.columns, ID_ALIASES),
+        "T_assumed": find_column(df.columns, ASSUMED_TEMP_ALIASES),
+    }
+
+    required_missing = [key for key in ["D", "tau", "G", "c_sigma"] if mapping[key] is None]
+    if required_missing:
+        raise ValueError(
+            "Не удалось автоматически распознать обязательные столбцы для калькулятора: "
+            + ", ".join(required_missing)
+            + ". Нужны как минимум D, tau, G, c_sigma."
+        )
+
+    prepared = pd.DataFrame(
+        {
+            "D": pd.to_numeric(df[mapping["D"]], errors="coerce"),
+            "tau": pd.to_numeric(df[mapping["tau"]], errors="coerce"),
+            "G": pd.to_numeric(df[mapping["G"]], errors="coerce"),
+            "c_sigma": pd.to_numeric(df[mapping["c_sigma"]], errors="coerce"),
+        }
+    )
+    if mapping["point_id"] is not None:
+        prepared["point_id"] = df[mapping["point_id"]].astype(str)
+    else:
+        prepared["point_id"] = [f"Точка {i + 1}" for i in range(len(prepared))]
+    if mapping["T_assumed"] is not None:
+        prepared["T_assumed"] = pd.to_numeric(df[mapping["T_assumed"]], errors="coerce")
+
+    prepared = prepared.dropna(subset=["D", "tau", "G", "c_sigma"]).copy()
+    prepared = prepared[(prepared["D"] > 0) & (prepared["tau"] > 0) & (prepared["c_sigma"] > 0)].copy()
+    prepared["grain_size_mm"] = prepared["G"].map(GRAIN_SIZE_MM)
+    prepared = prepared.dropna(subset=["grain_size_mm"]).copy()
+    if prepared.empty:
+        raise ValueError("После очистки не осталось корректных строк для калькулятора.")
+
+    prepared["ln_D"] = np.log(prepared["D"])
+    prepared["ln_tau"] = np.log(prepared["tau"])
+    prepared["ln_c_sigma"] = np.log(prepared["c_sigma"])
+    prepared["ln_grain_size"] = np.log(prepared["grain_size_mm"])
     return prepared.reset_index(drop=True)
 
 
@@ -233,7 +316,7 @@ def fit_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
 
     feature_columns = ["ln_D", "ln_tau", "ln_c_sigma"]
     if include_grain:
-        feature_columns.insert(2, "G")
+        feature_columns.insert(2, "ln_grain_size")
 
     X = df[feature_columns]
     X = sm.add_constant(X)
@@ -275,7 +358,7 @@ def fit_model(df: pd.DataFrame, include_grain: bool = True) -> FitResult:
         ("c", "ln_tau"),
     ]
     if include_grain:
-        coeff_labels.append(("d", "G"))
+        coeff_labels.append(("d", "ln_grain_size"))
         coeff_labels.append(("e", "ln_c_sigma"))
     else:
         coeff_labels.append(("d", "ln_c_sigma"))
@@ -385,6 +468,23 @@ def qq_plot(df: pd.DataFrame, title: str) -> None:
     plt.close(fig)
 
 
+def predict_temperature_from_params(params: dict[str, float], D: float, tau: float, grain_size_mm: float, c_sigma: float, include_grain: bool = True) -> float:
+    inv_t = float(params["const"])
+    inv_t += float(params["ln_D"]) * np.log(D)
+    inv_t += float(params["ln_tau"]) * np.log(tau)
+    if include_grain:
+        inv_t += float(params["ln_grain_size"]) * np.log(grain_size_mm)
+    inv_t += float(params["ln_c_sigma"]) * np.log(c_sigma)
+    if not np.isfinite(inv_t) or inv_t <= 0:
+        raise ValueError("Модель дала некорректное значение 1/T.")
+    return float(1.0 / inv_t - 273.15)
+
+
+def grain_mapping_caption() -> str:
+    pairs = [f"{int(k)} → {v:.3f} мм" for k, v in sorted(GRAIN_SIZE_MM.items())]
+    return "; ".join(pairs)
+
+
 def show_result_block(result: FitResult, key_prefix: str = "main", include_grain: bool = True) -> None:
     st.subheader("Показатели качества модели")
     metric_cards(result.metrics)
@@ -399,7 +499,7 @@ def show_result_block(result: FitResult, key_prefix: str = "main", include_grain
             f"{param_map['const']:.8f} "
             f"+ ({param_map['ln_D']:.8f})·ln(D) "
             f"+ ({param_map['ln_tau']:.8f})·ln(τ) "
-            f"+ ({param_map['G']:.8f})·G "
+            f"+ ({param_map['ln_grain_size']:.8f})·ln(dg) "
             f"+ ({param_map['ln_c_sigma']:.8f})·ln(cσ)"
         )
     else:
@@ -482,7 +582,7 @@ def show_result_block(result: FitResult, key_prefix: str = "main", include_grain
 
 st.title("Подбор регрессионной модели для экспериментальных точек")
 st.write(
-    "Модель: 1 / T = a + b·ln(D) + c·ln(τ) + d·G + e·ln(cσ), где T внутри расчета переводится в Кельвины."
+    "Модель: 1 / T = a + b·ln(D) + c·ln(τ) + d·ln(dg) + e·ln(cσ), где dg — средний размер зерна, а T внутри расчета переводится в Кельвины."
 )
 
 uploaded_file = st.file_uploader(
@@ -506,8 +606,9 @@ with st.expander("Предпросмотр исходных данных"):
     st.dataframe(raw_df, use_container_width=True)
 
 st.success(f"Загружено корректных точек: {len(prepared_df)}")
+st.caption(f"Соответствие номера зерна и среднего размера: {grain_mapping_caption()}")
 
-main_tab, grain_tab = st.tabs(["Общая модель", "Модели по номерам зерна"])
+main_tab, grain_tab, calc_tab = st.tabs(["Общая модель", "Модели по номерам зерна", "Калькулятор"])
 
 with main_tab:
     try:
@@ -563,3 +664,67 @@ with grain_tab:
                 f"Лучше всего модель выглядит для номера зерна {best_grain['Номер зерна']}: "
                 f"R²={best_grain['R²']:.4f}, RMSE={best_grain['RMSE, °C']:.4f} °C."
             )
+
+with calc_tab:
+    st.subheader("Ручной расчет температуры")
+    st.caption("Калькулятор использует коэффициенты общей модели, построенной по загруженному сверху файлу.")
+    main_params = result.params.set_index("Параметр модели")["Значение"].to_dict() if 'result' in locals() else None
+    if main_params is None:
+        st.error("Сначала должна успешно построиться общая модель.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            calc_tau = st.number_input("τ", min_value=1.0, value=1000.0, step=1.0, format="%.0f", key="calc_tau")
+        with c2:
+            calc_d = st.number_input("D", min_value=0.000001, value=1.0, step=0.01, format="%.6f", key="calc_d")
+        with c3:
+            calc_g = st.selectbox("Номер зерна G", sorted(GRAIN_SIZE_MM.keys()), key="calc_g")
+        with c4:
+            calc_sigma = st.number_input("cσ, %", min_value=0.000001, value=1.0, step=0.01, format="%.6f", key="calc_sigma")
+        if st.button("Рассчитать температуру", key="calc_button"):
+            try:
+                calc_temp = predict_temperature_from_params(main_params, calc_d, calc_tau, GRAIN_SIZE_MM[float(calc_g)], calc_sigma, include_grain=True)
+                st.metric("Расчетная температура, °C", f"{calc_temp:.4f}")
+            except Exception as exc:
+                st.error(f"Не удалось выполнить расчет: {exc}")
+
+        st.subheader("Пакетный расчет из XLS/XLSX/CSV")
+        st.caption("Шаблон должен содержать как минимум столбцы: point_id, tau, D, G, c_sigma. Поле 'предполагаемая температура' необязательно.")
+        calc_file = st.file_uploader(
+            "Загрузите файл для калькулятора",
+            type=["xls", "xlsx", "csv"],
+            key="calc_file_uploader",
+        )
+        if calc_file is not None:
+            try:
+                calc_raw_df = load_file(calc_file)
+                calc_df = prepare_calculation_dataframe(calc_raw_df)
+                calc_df["T_pred"] = calc_df.apply(
+                    lambda row: predict_temperature_from_params(
+                        main_params,
+                        float(row["D"]),
+                        float(row["tau"]),
+                        float(row["grain_size_mm"]),
+                        float(row["c_sigma"]),
+                        include_grain=True,
+                    ),
+                    axis=1,
+                )
+                if "T_assumed" in calc_df.columns:
+                    calc_df["ΔT"] = calc_df["T_pred"] - calc_df["T_assumed"]
+                    calc_df["|ΔT|"] = np.abs(calc_df["ΔT"])
+                st.dataframe(
+                    calc_df[[col for col in ["point_id", "tau", "D", "G", "grain_size_mm", "c_sigma", "T_assumed", "T_pred", "ΔT", "|ΔT|"] if col in calc_df.columns]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                export_df = calc_df.copy()
+                st.download_button(
+                    "Скачать результаты расчета CSV",
+                    data=export_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="calc_results.csv",
+                    mime="text/csv",
+                    key="download_calc_results",
+                )
+            except Exception as exc:
+                st.error(f"Не удалось обработать файл калькулятора: {exc}")
